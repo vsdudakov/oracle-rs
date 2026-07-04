@@ -968,6 +968,20 @@ impl Connection {
                     inner.server_info.supports_oob = accept.supports_oob;
                     inner.sdu_size = accept.sdu.min(65535) as u16;
 
+                    // Negotiate protocol-level capabilities advertised in the
+                    // ACCEPT packet. Without this call the END_OF_RESPONSE
+                    // capability bit is never set in the compile capabilities we
+                    // send to the server, so the server never terminates its
+                    // responses with the END_OF_RESPONSE data flag. Any response
+                    // that spans more than one TNS packet then has no reliable
+                    // terminator, leaving stray bytes on the socket (connection
+                    // desync / corruption on the next call).
+                    inner.capabilities.adjust_for_protocol(
+                        accept.protocol_version,
+                        accept.service_options,
+                        accept.flags2,
+                    );
+
                     inner.state = ConnectionState::Connected;
                     return Ok(());
                 }
@@ -2409,8 +2423,12 @@ impl Connection {
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
         inner.send(&request).await?;
 
-        // Receive and parse response
-        let response = inner.receive().await?;
+        // Receive and parse response. A query result larger than one TNS packet
+        // (roughly one SDU of rows) spans multiple packets; `receive()` reads
+        // only the first, so the parser runs off the end of the buffer. Use
+        // `receive_response()` to accumulate every packet up to the
+        // END_OF_RESPONSE terminator before parsing.
+        let response = inner.receive_response().await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty query response".to_string()));
         }
@@ -2450,8 +2468,8 @@ impl Connection {
             let define_request = define_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
             inner.send(&define_request).await?;
 
-            // Receive the re-execute response
-            let define_response = inner.receive().await?;
+            // Receive the re-execute response (multi-packet safe, as above)
+            let define_response = inner.receive_response().await?;
             if define_response.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty define response".to_string()));
             }
