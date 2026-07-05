@@ -603,11 +603,17 @@ impl ConnectionInner {
         // Marker packet structure: [length][0x00][0x00][0x00][0x0c][flags][0x00][0x00] + payload
         // Payload: [0x01][0x00][marker_type]
         let payload_len = 3; // 0x01, 0x00, marker_type
-        let total_len = (PACKET_HEADER_SIZE + payload_len) as u16;
+        let total_len = PACKET_HEADER_SIZE + payload_len;
 
-        // Header
-        buf.write_u16_be(total_len)?;
-        buf.write_u16_be(0)?; // zeros in large_sdu position
+        // Header. Large-SDU connections frame the length as a 4-byte word; a
+        // 2-byte length there is malformed and the server drops the connection
+        // (see the sibling `send_marker` for why that broke break/reset).
+        if self.large_sdu {
+            buf.write_u32_be(total_len as u32)?;
+        } else {
+            buf.write_u16_be(total_len as u16)?;
+            buf.write_u16_be(0)?; // checksum
+        }
         buf.write_u8(PacketType::Marker as u8)?;
         buf.write_u8(0)?; // flags
         buf.write_u16_be(0)?; // reserved
@@ -5036,10 +5042,20 @@ impl Connection {
     async fn send_marker(&self, inner: &mut ConnectionInner, marker_type: u8) -> Result<()> {
         let mut packet_buf = WriteBuffer::new();
 
-        // Build MARKER packet header
+        // Build MARKER packet header. The length field is a 4-byte word in
+        // large-SDU mode and a 2-byte word (plus a 2-byte checksum) otherwise —
+        // the same framing every other request uses. Writing a 2-byte length in
+        // large-SDU mode produces a malformed packet that the server cannot
+        // parse, so it drops the connection: that is why the RESET marker sent
+        // after a server break never elicited the error response (constraint
+        // violations surfaced as a lost connection instead of an ORA error).
         let packet_len = PACKET_HEADER_SIZE + 3; // Header + 3 bytes payload
-        packet_buf.write_u16_be(packet_len as u16)?;
-        packet_buf.write_u16_be(0)?; // Checksum
+        if inner.large_sdu {
+            packet_buf.write_u32_be(packet_len as u32)?;
+        } else {
+            packet_buf.write_u16_be(packet_len as u16)?;
+            packet_buf.write_u16_be(0)?; // Checksum
+        }
         packet_buf.write_u8(PacketType::Marker as u8)?;
         packet_buf.write_u8(0)?; // Flags
         packet_buf.write_u16_be(0)?; // Header checksum
