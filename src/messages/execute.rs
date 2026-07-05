@@ -15,6 +15,35 @@ use crate::error::Result;
 use crate::row::Value;
 use crate::statement::Statement;
 
+/// Largest chunk of bind data written per length-prefixed segment in the TTC
+/// long form. Oracle reads long values as a sequence of `[ub4 len][bytes]`
+/// chunks terminated by a zero-length chunk.
+const BIND_CHUNK_SIZE: usize = 32767;
+
+/// Write a bind value's raw bytes in Oracle's TTC length format.
+///
+/// Values up to 252 bytes use the short form (a single length byte followed by
+/// the data). Longer values use the long form: the `254` indicator, then the
+/// data split into `[ub4 chunk_len][chunk_bytes]` segments, then a terminating
+/// zero-length chunk. Omitting that terminator (writing the length and bytes as
+/// one un-terminated blob) desynchronises the server, which then rejects the
+/// statement and closes the connection — so values above the short-form limit
+/// could not be bound at all.
+fn write_chunked_bytes(buf: &mut WriteBuffer, data: &[u8]) -> Result<()> {
+    if data.len() <= 252 {
+        buf.write_u8(data.len() as u8)?;
+        buf.write_bytes(data)?;
+        return Ok(());
+    }
+    buf.write_u8(254)?; // long-form indicator
+    for chunk in data.chunks(BIND_CHUNK_SIZE) {
+        buf.write_ub4(chunk.len() as u32)?;
+        buf.write_bytes(chunk)?;
+    }
+    buf.write_ub4(0)?; // zero-length terminator chunk
+    Ok(())
+}
+
 /// Options for statement execution
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
@@ -761,28 +790,17 @@ impl<'a> ExecuteMessage<'a> {
                 buf.write_bytes(&encoded)?;
             }
             Value::String(s) => {
-                let bytes = s.as_bytes();
-                if bytes.is_empty() {
+                if s.is_empty() {
                     buf.write_u8(0)?; // Empty string = NULL in Oracle
-                } else if bytes.len() <= 252 {
-                    buf.write_u8(bytes.len() as u8)?;
-                    buf.write_bytes(bytes)?;
                 } else {
-                    buf.write_u8(254)?; // Long form indicator
-                    buf.write_ub4(bytes.len() as u32)?;
-                    buf.write_bytes(bytes)?;
+                    write_chunked_bytes(buf, s.as_bytes())?;
                 }
             }
             Value::Bytes(b) => {
                 if b.is_empty() {
                     buf.write_u8(0)?;
-                } else if b.len() <= 252 {
-                    buf.write_u8(b.len() as u8)?;
-                    buf.write_bytes(b)?;
                 } else {
-                    buf.write_u8(254)?;
-                    buf.write_ub4(b.len() as u32)?;
-                    buf.write_bytes(b)?;
+                    write_chunked_bytes(buf, b)?;
                 }
             }
             Value::Boolean(b) => {
