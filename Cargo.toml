@@ -139,6 +139,11 @@ features = [
 
 [dependencies.tokio-rustls]
 version = "0.26"
+# Use the pure-Rust ring provider (matches the yara-orm TLS stack); the
+# tokio-rustls default enables aws_lc_rs, whose C library fails to
+# cross-compile for aarch64-linux wheels.
+default-features = false
+features = ["logging", "tls12", "ring"]
 
 [dependencies.tracing]
 version = "0.1"
